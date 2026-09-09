@@ -6,7 +6,7 @@ const seedMail = async (c: Context<HonoCustomType>) => {
     if (!getBooleanValue(c.env.E2E_TEST_MODE)) {
         return c.text("Not available", 404);
     }
-    const { address, source, raw, message_id } = await c.req.json();
+    const { address, source, raw, message_id, created_at, address_updated_at, address_created_at } = await c.req.json();
     if (!address || !raw) {
         return c.text("address and raw are required", 400);
     }
@@ -16,11 +16,19 @@ const seedMail = async (c: Context<HonoCustomType>) => {
     if (message_id && message_id.length > 255) {
         return c.text("message_id too long", 400);
     }
+    if (address_updated_at !== undefined) {
+        await c.env.DB.prepare(`UPDATE address SET updated_at = ? WHERE name = ?`)
+            .bind(address_updated_at, address).run();
+    }
+    if (address_created_at !== undefined) {
+        await c.env.DB.prepare(`UPDATE address SET created_at = ? WHERE name = ?`)
+            .bind(address_created_at, address).run();
+    }
     const msgId = message_id || `<e2e-${Date.now()}@test>`;
     const { success } = await c.env.DB.prepare(
         `INSERT INTO raw_mails (message_id, source, address, raw, created_at)`
-        + ` VALUES (?, ?, ?, ?, datetime('now'))`
-    ).bind(msgId, source || address, address, raw).run();
+        + ` VALUES (?, ?, ?, ?, COALESCE(?, datetime('now')))`
+    ).bind(msgId, source || address, address, raw, created_at ?? null).run();
     return c.json({ success });
 };
 
@@ -29,7 +37,7 @@ const receiveMail = async (c: Context<HonoCustomType>) => {
     if (!getBooleanValue(c.env.E2E_TEST_MODE)) {
         return c.text("Not available", 404);
     }
-    const { from, to, raw } = await c.req.json();
+    const { from, to, raw, ai_extract_result } = await c.req.json();
     if (!from || !to || !raw) {
         return c.text("from, to and raw are required", 400);
     }
@@ -44,19 +52,38 @@ const receiveMail = async (c: Context<HonoCustomType>) => {
     if (!headers.has('Message-ID')) headers.set('Message-ID', `<e2e-${Date.now()}@test>`);
 
     const rawBytes = new TextEncoder().encode(raw);
-    const state = { rejected: undefined as string | undefined, replyCalled: false };
+    const state = { rejected: undefined as string | undefined, replyCalled: false, forwardedTo: [] as string[] };
     const mockMessage: ForwardableEmailMessage = {
         from, to, headers,
         rawSize: rawBytes.byteLength,
         raw: new ReadableStream({ start(ctrl) { ctrl.enqueue(rawBytes); ctrl.close(); } }),
         setReject(reason: string) { state.rejected = reason; },
-        forward: async () => ({ messageId: '' }),
+        forward: async (recipient: string) => { state.forwardedTo.push(recipient); return { messageId: '' }; },
         reply: async () => { state.replyCalled = true; return { messageId: '' }; },
     };
     const { email: emailHandler } = await import('../email');
-    await emailHandler(mockMessage, c.env, { waitUntil: () => {}, passThroughOnException: () => {} });
+    const aiExtractEnvOverrides: Partial<Bindings> = {
+        ENABLE_AI_EMAIL_EXTRACT: true,
+        AI: {
+            run: async () => ({ response: ai_extract_result })
+        } as unknown as Ai,
+    };
+    const env = ai_extract_result
+        ? { ...c.env, ...aiExtractEnvOverrides }
+        : c.env;
+    const executionContext: ExecutionContext = {
+        waitUntil: () => {},
+        passThroughOnException: () => {},
+        props: {}
+    };
+    await emailHandler(mockMessage, env, executionContext);
 
-    return c.json({ success: !state.rejected, replyCalled: state.replyCalled, ...(state.rejected ? { rejected: state.rejected } : {}) });
+    return c.json({
+        success: !state.rejected,
+        replyCalled: state.replyCalled,
+        forwardedTo: state.forwardedTo,
+        ...(state.rejected ? { rejected: state.rejected } : {})
+    });
 };
 
 export default { seedMail, receiveMail };
